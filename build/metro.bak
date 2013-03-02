@@ -1,0 +1,301 @@
+/******************************************************************************
+ FILE:          metro
+ DESCRIPTION:   implementation of metro, a concatentative functional
+                programming language rooted in retro. Metro is specially
+                designed as system-programming language featuring
+                auto parallelization for multi-core architectures. Its
+                envirionment is able to be implementable stand-alone even
+                for ressource restricted platforms without much effort.
+                The language featuring also platform-independent low-level
+                interfaces as flexible hardware-abstaction.
+ VERSION:       0.1
+ REMARKS:       first version
+ LICENCE:       Copyright (c) 2013, Matthias Schirm. All rights reserved.
+ 
+                Redistribution and use in source and binary forms, with or
+                without modification,  are  permitted  provided  that  the
+                following conditions are met:
+                
+                * Redistributions of source code must retain the above
+                copyright notice, this list of conditions and the following
+                disclaimer.
+                * Redistributions in binary form must reproduce the above
+                copyright notice, this list of conditions and the following
+                disclaimer in the documentation and/or other materials
+                provided with the distribution.
+                * Neither the name of the author nor the names of contributors
+                may be used to endorse or promote products derived from this
+                software without specific prior written permission.
+                                           
+                THIS SOFTWARE IS  PROVIDED  BY  THE  COPYRIGHT  HOLDER  AND
+                CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+                INCLUDING, BUT NOT LIMITED TO, THE  IMPLIED  WARRANTIES  OF
+                MERCHANTABILITY  AND  FITNESS  FOR A PARTICULAR PURPOSE ARE
+                DISCLAIMED. IN NO EVENT SHALL MATTHIAS SCHIRM BE LIABLE FOR
+                ANY DIRECT, INDIRECT, INCIDENTAL,  SPECIAL,  EXEMPLARY,  OR
+                CONSEQUENTIAL  DAMAGES  (INCLUDING,  BUT  NOT  LIMITED  TO,
+                PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS  OF  USE,
+                DATA, OR PROFITS;  OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+                AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+                LIABILITY, OR  TORT  (INCLUDING  NEGLIGENCE  OR  OTHERWISE)
+                ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+                ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ ******************************************************************************/
+
+/******************************************************************************
+  FUNCTION:    main
+  PARAMETER:   None
+  RETURN:      OS default
+  DESCRIPTION: Metro interpreter. 
+  REMARKS:     This is version 0.1
+
+               The dictionary format is as following:
+               
+                 fAttr: Type of return parameter -
+                   1: no return parameter
+                   2: NATURAL
+                   3: INTEGER
+                   4: CHAR
+                   5: STRING
+                   6: POINTER
+
+                 value: optional constant value in a format conform to fAttr.
+                        In case of fAttr = STRING -
+                          positive values: string size in cells
+                          negative values: reserved but not written memory
+                        In case of fAttr = POINTER -
+                          positive values: Pointer boundary
+                          negative values: reserved but not written memory
+                          zero:            NIL
+                        In case of fAttr = no return parameter
+                          positive values: IMMEDIATE function - return type
+                          zero, negative:  illegal
+                        otherwise -
+                          positive values: lenght of vm-code sequence
+                          zero, negative:  illegal
+                 
+                 ext1:  function type -
+                   0: no entry parameter
+                   1: 1  entry parameter
+                   2: 2  entry parameters
+                   3: 3  entry parameters
+                 
+                 ext2:  CFA (code-field address)       
+ ******************************************************************************/
+
+#define metroPrefRem     '#'
+#define metroPrefCond    '|'
+#define metroPrefImm     ';'
+#define metroPrefDef     ':'
+#define metroPrefChr     39
+#define metroPrefStr     '"'
+#define metroPrefAdd     '+'
+#define metroPrefSub     '-'
+#define metroPrefDiv     '/'
+#define metroPrefMul     '*'
+#define metroPrefAnd     '&'
+#define metroPrefOr      '°'
+#define metroPrefNegVal  '_'
+#define metroPostHexVal  'h'
+#define metroPostNat     'n'
+#define metroPostInt     'i'
+#define metroPostChr     'c'
+#define metroPostStr     's'
+#define metroPostPnt     'p'
+
+const tuCell markerStackSize = 32;
+
+
+#define metroMsgWelcome          "METRO 0.1 (C) Matthias Schirm, BSD LIZENZ (Alle Rechte reserviert)\n"
+#define metroMsgCodeStart        "Code Startadresse: %lxh\n"
+#define metroErrMsgMarkerStack   "\n[PARSER] FEHLER: Anzahl der Konditionen zu hoch, Deklaration wird ignoriert\n"
+#define metroErrMsgUnboundCond   "\n[FUNKTION] FEHLER: Nicht alle Konditionen wurden gebunden, Deklaration wird ignoriert\n"
+#define metroErrMsgUnboundParam  "\n[FUNKTION] FEHLER: Nicht alle Parameter wurden gebunden, Deklaration wird ignoriert\n"
+
+
+enum types  {NATURAL, INTEGER, CHAR, STRING, POINTER};
+enum btypes {PARALLEL, SERIELL, IMMEDIATE};
+enum states {EXECUTE, COMPILE};
+
+int main (int argc, char **argv)
+  {/* internal interpreter-state variables: ***********************************
+      erg:     needed for return values of some library functions
+      depth:   the current stack-depth at compilation
+      mDepth:  the maximal stack depth at compilation (its value is the
+               parameter number stored for function declarations)
+      sMarker: Actual code-address at begin of compilation (start-address for
+               function if no existing defination is temporary overwritten)
+      state:   interpreter state (compilation or code-execution if no function
+               was defined)
+      type:    current type of TOS value
+      bType:   branch type, select compilation of safe process creation
+               instead of a branch ********************************************/
+  
+   tuCell      erg     = 0;
+   tuCell      depth   = 0;
+   tuCell      mDepth  = 0;
+   tMarker     sMarker = 0x200;
+   enum types  type    = INTEGER;
+   enum states state   = COMPILE;
+   enum btypes bType   = SERIELL;
+   
+   /* internal stacks: ********************************************************
+      aMarker: stack holding the start-addresses of defined conditionals
+      aFunct:  stack holding the original start-address, dictionary and
+               dictionary offset for each temporary redefined function
+      oMarker: offset into aMarker (stack pointer) 
+      oFunct:  offset into aFunct *********************************************/
+   
+   tMarker     aMarker[markerStackSize];
+   tuCell      aFunct[markerStackSize * 3];
+   tuCell      oMarker = 0;
+   tuCell      oFunct  = 0;
+      
+   tuCell i;
+   char   ch;
+   aToken token;
+   tuInt8 fChar;
+   tuInt8 lChar;
+      
+   pAvmHandle pIntVM1 = avmCreateHandle (0xFFFF);
+   pAsmHandle pAsmVM1 = asmCreateHandle (pIntVM1);
+   
+   pDict pDicNat0 = dictCreateHandle ();
+   pDict pDicInt0 = dictCreateHandle ();
+   pDict pDicChr0 = dictCreateHandle ();
+   pDict pDicStr0 = dictCreateHandle ();
+   pDict pDicPnt0 = dictCreateHandle ();   
+   pDict pDicNat1 = dictCreateHandle ();
+   pDict pDicInt1 = dictCreateHandle ();
+   pDict pDicChr1 = dictCreateHandle ();
+   pDict pDicStr1 = dictCreateHandle ();
+   pDict pDicPnt1 = dictCreateHandle ();
+   pDict pDicNat2 = dictCreateHandle ();
+   pDict pDicInt2 = dictCreateHandle ();
+   pDict pDicChr2 = dictCreateHandle ();
+   pDict pDicStr2 = dictCreateHandle ();
+   pDict pDicPnt2 = dictCreateHandle ();
+   pDict pDicNat3 = dictCreateHandle ();
+   pDict pDicInt3 = dictCreateHandle ();
+   pDict pDicChr3 = dictCreateHandle ();
+   pDict pDicStr3 = dictCreateHandle ();
+   pDict pDicPnt3 = dictCreateHandle ();
+         
+   printw (metroMsgWelcome);
+   
+   sMarker = asmMarker (pAsmVM1); printw (metroMsgCodeStart, sMarker);
+   
+   parser: /* description *****************************************************
+                seperating tokens (strings with max. depth of tokenSize-1
+                characters. Characters > tokenSize-1 are ignored. Token
+                seperator is the space character. All control characters
+                other than LN are mapped to space which encode the end
+                of declaration
+              *****************************************************************/
+           
+           for (i = 0; ch != ' '; i++)
+                {if (i > tokenSize-1) break;
+                 
+                 ch = getch();
+                      if (ch == '\n') {state = EXECUTE; ch = ' ';}
+                      if (ch <  20)   {ch = ' ';}
+                 
+                 printw ("%c",ch); token[i] = (tuInt8) ch;}
+           
+           /* description *****************************************************
+                The first and last characters of a token are special as
+                these define its prefix and postfix application. fChar
+                stores a possible prefix and lchar postfix characters.
+                Please note for a non valid token the value of fChar
+                equals the value of lChar!
+              *****************************************************************/
+
+           fChar = token[0];
+           lChar = token[i-2];
+                         
+           token[tokenSize] = (tuInt8) '\0';
+           token[i-2]       = (tuInt8) '\0';
+           
+           //printw ("fChar: %c lChar: %c\n",fChar,lChar);
+
+           /* description *****************************************************           
+                a token was parsed and the prefix character is stored in fChar,
+                the postfix operator in lChar. Characters from token[1] to
+                token != lChar define a token string or label. If a label do
+                not exist, fChar and lChar hold the same character value and
+                the parsed token is empty. Now the outer interpretation
+                begins:
+                
+                First, empty labels are just ignored! Interpretation starts
+                with defined application of the prefixes and then the
+                postfixes. After this step the label is parsed for matching
+                intrinsic functions and corresponding code is generated
+                immediatly. If no intrinsic function is found, the appropriate
+                dictionary, dependent on the actual stack and type state is
+                searched and the priour compiled vm-code for the function is
+                inlined if found. Otherwise the label content is converted
+                to a natural and compiled as immediate value. If this fails,
+                an error is displayed *****************************************/ 
+           
+           switch (fChar)
+             {case metroPrefRem:
+                {while (ch != '\n') {ch = getch (); printw ("%c", ch);}
+                 break;}
+              case metroPrefCond:
+                {ch = '\0';
+				 aMarker[oMarker++] = sMarker;
+                 if (oMarker > markerStackSize-1)
+                     {printw (metroErrMsgMarkerStack); oMarker = 0;
+                      state = COMPILE; goto parser;}
+				 break;}
+			  case metroPrefDef:
+			    {ch = '\0';
+			     if (oMarker > 0)
+			         {printw (metroErrMsgUnboundCond);
+			          oMarker = 0; state = COMPILE; goto parser;}
+			     if (depth > 1)
+			         {printw (metroErrMsgUnboundParam);
+                      oMarker = 0; state = COMPILE; goto parser;}
+                 switch (mDepth)
+                   {0: switch (type)
+                         {NATURAL: erg = dictSearchLabel (pDicNat0, token+1);
+                                   if (erg != dictSize)
+                                       {dictPushLabel(pDicNat0,(tuInt8) type,
+                                          (tsInt8) pAsmVM1->pos, 0, sMarker);                                  
+                }
+                 
+             }
+   
+   ch = '\0';
+   goto parser;
+   
+   // free allocated memory
+
+   dictDisposeHandle (pDicNat0);
+   dictDisposeHandle (pDicInt0);
+   dictDisposeHandle (pDicChr0);
+   dictDisposeHandle (pDicStr0);
+   dictDisposeHandle (pDicPnt0);   
+   dictDisposeHandle (pDicNat1);
+   dictDisposeHandle (pDicInt1);
+   dictDisposeHandle (pDicChr1);
+   dictDisposeHandle (pDicStr1);
+   dictDisposeHandle (pDicPnt1);
+   dictDisposeHandle (pDicNat2);
+   dictDisposeHandle (pDicInt2);
+   dictDisposeHandle (pDicChr2);
+   dictDisposeHandle (pDicStr2);
+   dictDisposeHandle (pDicPnt2);
+   dictDisposeHandle (pDicNat3);
+   dictDisposeHandle (pDicInt3);
+   dictDisposeHandle (pDicChr3);
+   dictDisposeHandle (pDicStr3);
+   dictDisposeHandle (pDicPnt3);
+   
+   asmDisposeHandle  (pAsmVM1);                       
+   avmDisposeHandle  (pIntVM1);
+   
+   // reset console settings and exit interpreter
+   
+   endwin (); return 0;}
+
